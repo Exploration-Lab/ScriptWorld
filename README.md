@@ -96,7 +96,7 @@ The ScriptWorld Environment follows [CC-BY-NC](CC-BY-NC) license. Thus, users ca
 
 ## Citation
 
-Please cite our paper if you use ScriptWorld in your work:
+Please cite our papers if you use ScriptWorld in your work:
 
 **ScriptWorld: Text Based Environment For Learning Procedural Knowledge**, Proceedings of the Thirty-Second International Joint Conference on Artificial Intelligence, [IJCAI 2023](https://ijcai-23.org), August 19-25, 2023, Macao, SAR. (Main Track)
 
