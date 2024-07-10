@@ -10,36 +10,44 @@ from gym import spaces
 from tqdm import tqdm
 import torch
 
-
 def set_seed(seed: int = 21) -> None:
+    """Set random seeds for reproducibility."""
     np.random.seed(seed)
     random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed) 
+    torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     os.environ["PYTHONHASHSEED"] = str(seed)
 
-
 class ScriptWorldEnv(gym.Env):
+    """
+    A custom OpenAI Gym environment for script-based scenarios.
+    
+    This environment simulates various scenarios (e.g., "baking a cake") as a graph-based
+    world where the agent needs to take correct actions to reach the goal state.
+    """
+
     def __init__(
         self,
-        scn='baking a cake',
-        no_of_actions=5,
+        scenario='baking a cake',
+        num_actions=5,
         allowed_wrong_actions=5,
         hop=1,
         seed=42,
         disclose_state_node=True,
-        
-    ):  # e.g scn = bake a cake
-        self.scn = scn
+    ):
+        self.scenario = scenario
         set_seed(seed)
-        self.scn_graph = self.create_graph(scn)
-        self.disclose_state_node = disclose_state_node
-        self.cg = self.create_compact_graph(self.scn_graph)
-        self.state_node = self.scn_graph["nodes"][0]["id"]
+        
+        # Initialize scenario graph and related attributes
+        self.scenario_graph = self._create_graph(scenario)
+        self.compact_graph = self._create_compact_graph(self.scenario_graph)
+        self.state_node = self.scenario_graph["nodes"][0]["id"]
         self.state = self.state_node.partition("_")[0]
-        self.sample_scn = {
+        
+        # Define scenario-specific attributes
+        self.sample_scenarios = {
             "flying in an airplane": 8,
             "repairing a flat bicycle tire": 6,
             "borrowing a book from the library": 5,
@@ -51,469 +59,310 @@ class ScriptWorldEnv(gym.Env):
             "going on a train": 4,
             "taking a bath": 6,
         }
-        self.sampling_dist = self.sample_scn[self.scn]  
+        self.sampling_dist = self.sample_scenarios[self.scenario]
 
-       
-
-        self.t = 0
-        g = self.cg
-  
-        self.traj = []
-        self.R = 0
-       
-        self.cg.nodes[self.state]["no"] = 0
-        self.dfs_init(g, self.state, 1)
-        self.dfs_max(g, self.state, 1)
-        self.Victory_node = self.cg.nodes["Victory"]["no"]
-        self.wc = allowed_wrong_actions
-        self.sib = {}
-        self.w_count = 0
-        self.per_clp = 0
-        self.seq_no = 0
+        # Initialize environment state
+        self.disclose_state_node = disclose_state_node
+        self.trajectory = []
+        self.total_reward = 0
+        self.wrong_action_count = 0
+        self.completion_percentage = 0
+        self.sequence_number = 0
         self.hop = hop
-        # self.seed  = seed
         self.done = False
-        self.quest = self.scn_graph["nodes"][0]["quest"]
-        self.no_of_actions = no_of_actions
-        self.action_spaces = []
-        if disclose_state_node :
-          self.observation_space=spaces.Box(low=-10000,high=10000,shape=((no_of_actions),))
-          self.action_space=spaces.Discrete(no_of_actions)
-            
-        else :
-          self.observation_space=spaces.Box(low=-10000,high=10000,shape=((no_of_actions),))
-          self.action_space=spaces.Discrete(no_of_actions)
+        self.quest = self.scenario_graph["nodes"][0]["quest"]
+        self.num_actions = num_actions
+        self.allowed_wrong_actions = allowed_wrong_actions
 
+        # Set up action and observation spaces
+        self.action_space = spaces.Discrete(num_actions)
+        self.observation_space = spaces.Box(low=-10000, high=10000, shape=(num_actions,))
+
+        # Initialize graph node numbers
+        self._initialize_graph_numbers()
+
+        # Load sibling dictionary
+        self.sib_dict = self._load_sibling_dict()
+
+        action_choices = []
+        for d in self.scenario_graph["links"]:
+            if d["source"] == self.state_node:
+                action_choices.append(d["target"])
+
+        self.state_node = random.choice(action_choices)
+        self.forbidden = []
+        self._update_forbidden_actions()
+
+        # Initialize action spaces and forbidden actions
+        self.action_spaces = self._initialize_action_spaces()
+        
+    def step(self, action):
+        """
+        Take a step in the environment based on the chosen action.
+
+        Args:
+            action (int): The index of the chosen action.
+
+        Returns:
+            tuple: (observation, reward, done, info)
+        """
+        self.done = False
+        self.prev_state = self.state_node.partition("_")[0]
+
+        # Find the correct action for the current state
+        correct_action = next(node["action"] for node in self.scenario_graph["nodes"] if node["id"] == self.state_node)
+
+        if self.action_spaces[action] == correct_action:
+            # Correct action taken
+            self._handle_correct_action()
+        else:
+            # Wrong action taken
+            self._handle_wrong_action()
+
+        # Update state and check for terminal conditions
+        self.state = self.state_node.partition("_")[0]
+        self._update_completion_percentage()
+        self._check_terminal_conditions()
+
+        # Generate new action spaces
+        self.action_spaces = self._generate_new_action_spaces()
+
+        # Prepare the observation
+        observation = self._get_observation()
+
+        return (
+            observation,
+            self.reward,
+            self.done,
+            {
+                "completion_percentage": self.completion_percentage,
+                "trajectory": self.trajectory,
+            }
+        )
+
+    def reset(self):
+        """
+        Reset the environment to its initial state.
+
+        Returns:
+            list: The initial observation.
+        """
+        self.state_node = self.scenario_graph["nodes"][0]["id"]
+        self.wrong_action_count = 0
+        self.done = False
+        self.completion_percentage = 0
+        self.trajectory = []
+        self.total_reward = 0
+
+        # Choose a random starting state
+        possible_starts = [d["target"] for d in self.scenario_graph["links"] if d["source"] == self.state_node]
+        self.state_node = random.choice(possible_starts)
+        self.state = self.state_node.partition("_")[0]
+
+        # Generate initial action spaces
+        self.action_spaces = self._generate_new_action_spaces()
+
+        return self._get_observation()
+
+    def _create_graph(self, scenario):
+        """Load the scenario graph from a JSON file."""
+        dir_path = os.path.dirname(os.path.realpath(__file__))
+        file = scenario + ".json"
+        with open(os.path.join(dir_path, "json", file), "r") as f:
+            data = f.read()
+        return json.loads(json.loads(data))
+
+    def _create_compact_graph(self, graph):
+        """Create a compact version of the scenario graph."""
+        G = nx.DiGraph()
+        for node in graph["nodes"]:
+            if node["id"] == "Victory":
+                G.add_node(node["id"])
+                continue
+            if node["id"].endswith("_l"):
+                base_id = node["id"][:-2]
+                G.add_node(base_id)
+                for link in graph["links"]:
+                    if link["source"] == node["id"]:
+                        target = "Victory" if link["target"] == "Victory" else link["target"][:-2]
+                        G.add_node(target)
+                        G.add_edge(base_id, target)
+            elif node["id"].endswith("_e"):
+                base_id = node["id"][:-2]
+                G.add_node(base_id)
+                split_ways = sum(1 for link in graph["links"] if link["source"] == node["id"])
+                G.nodes[base_id]["split_ways"] = split_ways
+
+        for node in G.nodes:
+            G.nodes[node]["no"] = 0
+        return G
+
+    def _initialize_graph_numbers(self):
+        """Initialize node numbers in the compact graph."""
+        self.compact_graph.nodes[self.state]["no"] = 0
+        self._dfs_init(self.compact_graph, self.state, 1)
+        self._dfs_max(self.compact_graph, self.state, 1)
+        self.victory_node_number = self.compact_graph.nodes["Victory"]["no"]
+
+    def _dfs_init(self, graph, node, number):
+        """Depth-first search to initialize node numbers."""
+        if node == "Victory":
+            self.compact_graph.nodes[node]["no"] = number
+            return
+        for neighbor in self.compact_graph[node]:
+            self.compact_graph.nodes[neighbor]["no"] = number
+            self._dfs_init(graph, neighbor, number + 1)
+
+    def _dfs_max(self, graph, node, number):
+        """Depth-first search to maximize node numbers."""
+        if node == "Victory":
+            self.compact_graph.nodes[node]["no"] = max(number, self.compact_graph.nodes[node]["no"])
+            return
+        for neighbor in self.compact_graph[node]:
+            self.compact_graph.nodes[neighbor]["no"] = max(number, self.compact_graph.nodes[neighbor]["no"])
+            self._dfs_max(graph, neighbor, number + 1)
+
+    def _load_sibling_dict(self):
+        """Load the sibling dictionary from a pickle file."""
         current_dir = os.path.dirname(os.path.abspath(__file__))
         fname = os.path.join(current_dir, "sib_dict.pickle")
         with open(fname, "rb") as f:
             data = pickle.load(f)
+        return data[self.scenario]
 
-        self.sib_dict = data[scn]
-
-        A = []
-        for d in self.scn_graph["links"]:
-
-            if d["source"] == self.state_node:
-                A.append(d["target"])
-
-        self.state_node = random.choice(A)
-        for node in self.scn_graph["nodes"]:
-
+    def _initialize_action_spaces(self):
+        """Initialize the action spaces for the current state."""
+        self.action_spaces = []
+        for node in self.scenario_graph["nodes"]:
             if node["id"] == self.state_node:
                 self.action_spaces.append(node["action"])
-
                 break
+        return self._add_wrong_actions(self.action_spaces)
 
+    def _add_wrong_actions(self, action_spaces):
+        """Add incorrect actions to the action spaces."""
         count = 0
-        Wrong_samples = []
-        self.forbidden = []
-        self.forbidden.extend(self.cg.successors(self.state_node.partition("_")[0]))
-        self.forbidden.extend(self.cg.predecessors(self.state_node.partition("_")[0]))
+        while count < self.num_actions - 1:
+            node = random.choice(self.scenario_graph["nodes"])
+            if self._is_valid_wrong_action(node):
+                count += 1
+                action_spaces.append(node["action"])
+        random.shuffle(action_spaces)
+        return action_spaces
+
+    def _is_valid_wrong_action(self, node):
+        """Check if a node is a valid wrong action."""
+        if node["id"].partition("_")[0] in self.forbidden:
+            return False
+        if abs(self.compact_graph.nodes[node["id"].partition("_")[0]]["no"] - self.compact_graph.nodes[self.state]["no"]) <= self.sampling_dist:
+            return False
+        if node["id"] == "Victory" or node["id"].partition("_")[0] == self.state_node.partition("_")[0]:
+            return False
+        if node["type"] != "slot":
+            return False
+        if node["action"] in self.action_spaces or node["action"] in self.forbidden_actions:
+            return False
+        return True
+
+    def _update_forbidden_actions(self):
+        """Update the list of forbidden actions."""
+        self.forbidden.extend(self.compact_graph.successors(self.state_node.partition("_")[0]))
+        self.forbidden.extend(self.compact_graph.predecessors(self.state_node.partition("_")[0]))
         self.forbidden_actions = [
             node["action"]
-            if node["id"].partition("_")[0] in self.forbidden
-            and node["id"] != "Victory"
-            and node["type"] == "slot"
-            else None
-            for node in list(self.scn_graph["nodes"])
+            for node in self.scenario_graph["nodes"]
+            if node["id"].partition("_")[0] in self.forbidden and node["id"] != "Victory" and node["type"] == "slot"
         ]
 
-        while count < self.no_of_actions - 1:
+    def _handle_correct_action(self):
+        """Handle the case when the correct action is taken."""
+        self.trajectory.append([self.state_node, 0])
+        self.reward = 0
+        self.wrong_action_count = 0
+        self._move_to_next_state()
 
-            node = random.choice(self.scn_graph["nodes"])
-            if node["id"].partition("_")[0] in self.forbidden:
-                continue
-            
-            if (
-                abs(
-                    self.cg.nodes[node["id"].partition("_")[0]]["no"]
-                    - self.cg.nodes[self.state]["no"]
-                )
-                <= self.sampling_dist
-            ):
-                continue
-            if node["id"] == "Victory":
-                continue
-            if node["id"].partition("_")[0] in Wrong_samples:
-                continue
-            if (
-                node["id"].partition("_")[0] != self.state_node.partition("_")[0]
-                and node["type"] == "slot"
-            ):
-                if (
-                    node["action"] in self.action_spaces
-                    or node["action"] in self.forbidden_actions
-                ):
-                    continue
-                count += 1
-                Wrong_samples.append(node["id"].partition("_")[0])
-                self.action_spaces.append(node["action"])
-        random.shuffle(self.action_spaces)
+    def _handle_wrong_action(self):
+        """Handle the case when a wrong action is taken."""
+        self.wrong_action_count += 1
+        self.reward = -1
+        self.total_reward -= 1
+        self.trajectory.append([self.state_node, -1])
+        self._update_forbidden_after_wrong_action()
+        self._move_after_wrong_action()
 
-    def step(self, action):
-
-        
-
-        self.done = False
-        self.prev_state = self.state_node.partition("_")[0]
-
-        for node in self.scn_graph["nodes"]:
-
-            if node["id"] == self.state_node:
-                self.right = node["action"]
-
+    def _move_to_next_state(self):
+        """Move to the next state after a correct action."""
+        for edge in self.scenario_graph["links"]:
+            if edge["source"] == self.state_node:
+                self.state_node = edge["target"]
                 break
+        if self.state_node.endswith("_l"):
+            self._handle_leaf_node()
 
-       
-        if self.action_spaces[action] == self.right:
+    def _handle_leaf_node(self):
+        """Handle the case when the current state is a leaf node."""
+        possible_targets = [edge["target"] for edge in self.scenario_graph["links"] if edge["source"] == self.state_node]
+        self.state_node = random.choice(possible_targets)
+        if self.state_node != "Victory":
+            possible_targets = [edge["target"] for edge in self.scenario_graph["links"] if edge["source"] == self.state_node]
+            self.state_node = random.choice(possible_targets)
 
-            self.traj.append([self.state_node, 0])
-            self.reward = 0
-            self.w_count = 0
-            for edge in self.scn_graph["links"]:
-                if edge["source"] == self.state_node:
-                    self.state_node = edge["target"]
-                    break
+    def _update_forbidden_after_wrong_action(self):
+        """Update forbidden states after a wrong action."""
+        current_state = self.state_node.partition("_")[0]
+        try:
+            self.forbidden = self.sib_dict[current_state][self.prev_state]
+            self.forbidden = list(set(self.forbidden))
+        except KeyError:
+            self.forbidden = []
 
-            if (
-                self.state_node[-1] == "l" and self.state_node[-2] == "_"
-            ):  # it is a leave node,need more transition ,random seed will be used
+    def _move_after_wrong_action(self):
+        """Move to a new state after a wrong action."""
+        current_state = self.state_node.partition("_")[0]
+        if self.hop != -1:
+            if self.hop == 0:
+                self.state_node = current_state + "_e"
+            elif self.hop == 1:
+                try:
+                    sibling_nodes = list(self.sib_dict[current_state].keys())
+                    random.shuffle(sibling_nodes)
+                    current_state = random.choice(sibling_nodes)
+                except KeyError:
+                    pass
+                self.state_node = current_state + "_e"
+            possible_targets = [edge["target"] for edge in self.scenario_graph["links"] if edge["source"] == self.state_node]
+            self.state_node = random.choice(possible_targets)
 
-                p_t = []
-                
-                for edge in self.scn_graph["links"]:
-                    if edge["source"] == self.state_node:
-                        p_t.append(edge["target"])
-                        
-                
-                self.state_node = random.choice(p_t)
+    def _update_completion_percentage(self):
+        """Update the completion percentage of the scenario."""
+        self.completion_percentage = (self.compact_graph.nodes[self.state]["no"] / self.victory_node_number) * 100
 
-                # on entry node now
-                if self.state_node != "Victory":
-                    # percentage following
-
-                    p_t = []
-                    for edge in self.scn_graph["links"]:
-
-                        if edge["source"] == self.state_node:
-                            p_t.append(edge["target"])
-
-                    
-                    self.state_node = random.choice(p_t)
-            try:
-                # banning siblings
-                
-                self.forbidden = self.sib_dict[self.state_node.partition("_")[0]][
-                    self.prev_state
-                ]
-
-                self.forbidden = list(set(self.forbidden))
-
-            except:
-
-                self.forbidden = []
-
-        else:
-            self.w_count += 1
-            self.reward = -1
-            self.R -= 1
-            self.traj.append([self.state_node, -1])
-            n_cg = self.state_node.partition("_")[0]
-
-            try:
-                self.forbidden = list(self.sib_dict[n_cg].keys())
-            except:
-                self.forbidden = []
-
-            # no = self.cg.nodes[n_cg]['no']
-            # no = max(0,no-self.hop)
-            if self.hop != -1:
-                
-                if self.hop == 0:
-                    self.state_node = n_cg + "_e"
-
-                elif self.hop == 1:
-
-                    try:
-                        SN = list(self.sib_dict[n_cg].keys())
-                        random.shuffle(SN)
-                        n_cg = random.choice(SN)
-
-                    except:
-                        pass
-
-                    self.state_node = n_cg + "_e"
-
-                # now on entry node
-
-                p_t = []
-                for edge in self.scn_graph["links"]:
-
-                    if edge["source"] == self.state_node:
-
-                        p_t.append(edge["target"])
-
-                
-                self.state_node = random.choice(p_t)
-
-        self.state = self.state_node.partition("_")[0]
-        self.prev = self.per_clp
-        self.per_clp = (
-            self.cg.nodes[self.state_node.partition("_")[0]]["no"]
-            / self.cg.nodes["Victory"]["no"]
-        )
-        if self.state_node == "Victory" or self.w_count == self.wc:  # Terminal state
-
+    def _check_terminal_conditions(self):
+        """Check if the episode has reached a terminal state."""
+        if self.state_node == "Victory" or self.wrong_action_count == self.allowed_wrong_actions:
             self.done = True
-
-            if self.w_count == self.wc:
-                self.reward += -5
-                self.R += -5
-
+            if self.wrong_action_count == self.allowed_wrong_actions:
+                self.reward -= 5
+                self.total_reward -= 5
             else:
                 self.reward += 10
-                self.R += 10
-           
-            self.traj.append([self.state_node, self.reward])
-           
-        self.completion_percentage = (
-            self.cg.nodes[self.state]["no"] / self.Victory_node
-        ) * 100
-        
-        # new action space
+                self.total_reward += 10
+            self.trajectory.append([self.state_node, self.reward])
 
-        self.action_spaces = []
-        if not self.done:
-            A = []
-            for node in self.scn_graph["nodes"]:
-
-                if node["id"] == self.state_node and node["type"] == "slot":
-                    self.action_spaces.append(node["action"])
-                    break
-            
-            count = 0
-            Wrong_samples = []  # keep check of diversity of -ve samples
-             # checking of non unique mapping of compact nodes to actions
-            self.forbidden.extend(self.cg.successors(self.state_node.partition("_")[0]))
-            self.forbidden.extend(
-                self.cg.predecessors(self.state_node.partition("_")[0])
-            )
-            self.forbidden_actions = [
-                node["action"]
-                if node["id"].partition("_")[0] in self.forbidden
-                and node["id"] != "Victory"
-                and node["type"] == "slot"
-                else None
-                for node in list(self.scn_graph["nodes"])
-            ]
-
-            while count < self.no_of_actions - 1:
-                node = random.choice(self.scn_graph["nodes"])
-                if node["id"].partition("_")[0] in self.forbidden:
-                    continue
-
-                if (
-                    abs(
-                        self.cg.nodes[node["id"].partition("_")[0]]["no"]
-                        - self.cg.nodes[self.state]["no"]
-                    )
-                    <= self.sampling_dist
-                ):
-                    continue
-                if node["id"] == "Victory":
-                    continue
-                if node["id"].partition("_")[0] in Wrong_samples:
-                    continue
-                if (
-                    node["id"].partition("_")[0] != self.state_node.partition("_")[0]
-                    and node["type"] == "slot"
-                ):
-                    if (
-                        node["action"] in self.action_spaces
-                        or node["action"] in self.forbidden_actions
-                    ):
-                        continue
-                    count += 1
-                    Wrong_samples.append(node["id"].partition("_")[0])
-                    self.action_spaces.append(node["action"])
-       
-        random.shuffle(self.action_spaces)
-
-       
-        if self.disclose_state_node:
-            
-            return (
-                
-                [self.state_node] + self.action_spaces,
-                self.reward,
-                self.done,
-                {
-                    "per_clp": self.completion_percentage,
-                    "traj": self.traj,
-                }  
-            )
-        else:
-            return (
-               
-                self.action_spaces,
-                self.reward,
-                self.done,
-                {
-                    "per_clp": self.completion_percentage,
-                    "traj": self.traj,
-                },  
-            )
-
-    def reset(self):
-
-        self.state_node = self.scn_graph["nodes"][0]["id"]
-        self.w_count = 0
-        self.done = False
-        self.action_spaces = []
-        self.per_clp = 0
-        self.traj = []
-        self.R = 0
-        A = []
-        for d in self.scn_graph["links"]:
-
-            if d["source"] == self.state_node:
-                A.append(d["target"])
-        # accounting for siblings
-        self.Siblings = []
-        for S in self.cg.edges:
-
-            if S[0] == self.state_node.partition("_")[0]:
-                self.Siblings.append(S[1])
-
-        
-        self.state_node = random.choice(A)
-        self.state = self.state_node.partition("_")[0]
-        for node in self.scn_graph["nodes"]:
-
-            if node["id"] == self.state_node:
-                
-                self.action_spaces.append(node["action"])
+    def _generate_new_action_spaces(self):
+        """Generate new action spaces for the current state."""
+        if self.done:
+            return []
+        action_spaces = []
+        for node in self.scenario_graph["nodes"]:
+            if node["id"] == self.state_node and node["type"] == "slot":
+                action_spaces.append(node["action"])
                 break
+        return self._add_wrong_actions(action_spaces)
 
-        count = 0
-        self.forbidden = []
-
-        self.forbidden.extend(self.cg.successors(self.state_node.partition("_")[0]))
-        self.forbidden.extend(self.cg.predecessors(self.state_node.partition("_")[0]))
-       
-        self.forbidden_actions = [
-            node["action"]
-            if node["id"].partition("_")[0] in self.forbidden
-            and node["id"] != "Victory"
-            and node["type"] == "slot"
-            else None
-            for node in list(self.scn_graph["nodes"])
-        ]
-        while count < self.no_of_actions - 1:
-            node = random.choice(self.scn_graph["nodes"])
-            if node["id"].partition("_")[0] in self.forbidden:
-                continue
-            if (
-                abs(
-                    self.cg.nodes[node["id"].partition("_")[0]]["no"]
-                    - self.cg.nodes[self.state]["no"]
-                )
-                <= self.sampling_dist
-            ):
-                continue
-            if node["id"] == "Victory":
-                continue
-            if node["id"] != self.state_node and node["type"] == "slot":
-                if (
-                    node["action"] in self.action_spaces
-                    or node["action"] in self.forbidden_actions
-                ):
-                    continue
-                count += 1
-                self.action_spaces.append(node["action"])
-
-       
-
-        random.shuffle(self.action_spaces)
-
-       
+    def _get_observation(self):
+        """Get the current observation based on the environment state."""
         if self.disclose_state_node:
-
-           
             return [self.state_node] + self.action_spaces
-
         else:
-           
             return self.action_spaces
-
-    def create_graph(self, scn):
-        dir_path = os.path.dirname(os.path.realpath(__file__))
-        file = scn + ".json"
-        with open(os.path.join(dir_path, "json", file), "r") as myfile:
-            data = myfile.read()
-
-        json_str = json.loads(data)
-        df = json.loads(json_str)
-
-        return df
-
-    def create_compact_graph(self, D):
-        g = D
-        G = nx.DiGraph()
-        for n in g["nodes"]:
-            # leave node
-            if n["id"] == "Victory":
-                G.add_node(n["id"])
-                continue
-
-            if n["id"][-1] == "l" and n["id"][-2] == "_":
-
-                G.add_node(n["id"][:-2])
-                for d in g["links"]:
-
-                    if d["source"] == n["id"]:
-
-                        if d["target"] == "Victory":
-                            G.add_node(d["target"])
-                            G.add_edge(n["id"][:-2], d["target"])
-                            continue
-                        G.add_node(d["target"][:-2])
-                        G.add_edge(n["id"][:-2], d["target"][:-2])
-
-            if n["id"][-1] == "e" and n["id"][-2] == "_":
-                count = 0
-                for d in g["links"]:
-                    if d["source"] == n["id"]:
-                        G.add_node(n["id"][:-2])
-                        count += 1
-                        G.nodes[n["id"][:-2]]["split_ways"] = count
-
-        for i in G.nodes:
-            G.nodes[i]["no"] = 0
-        return G
-
-    def dfs_init(self, g, n, t):
-
-        if n == "Victory":
-            self.cg.nodes[n]["no"] = t
-
-            return
-
-        else:
-
-            for i in self.cg[n].keys():
-                self.cg.nodes[i]["no"] = t
-                self.dfs_init(g, i, t + 1)
-
-    def dfs_max(self, g, n, t):
-
-        if n == "Victory":
-            self.cg.nodes[n]["no"] = max(t, self.cg.nodes[n]["no"])
-
-            return
-        else:
-            for i in self.cg[n].keys():
-                self.cg.nodes[i]["no"] = max(t, self.cg.nodes[i]["no"])
-                self.dfs_max(g, i, t + 1)
-

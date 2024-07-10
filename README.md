@@ -35,15 +35,15 @@ This repository contains the official release of the following paper:
 
 The terminal version of ScriptWorld can be run using the following command:
 
-    Script_World/envs/$ python Script_World_terminal.py --scn 'baking a cake' --no_of_actions 2 --allowed_wrong_actions=5 --hop 1 --disclose_state_node True --seed 42 --history
+    Script_World/envs/$ python Script_World_terminal.py --scenario 'baking a cake' --num_actions 2 --allowed_wrong_actions=5 --hop 1 --disclose_state_node --seed 4 --history
 
 
 
 <!-- table -->
 | Argument | Description |
 | --- | --- |
-| `scn` | Selects task/scenario (among the available 10 scenarios) |
-| `no_of_actions` | Number of action/choices at every step |
+| `scenario` | Selects task/scenario (among the available 10 scenarios) |
+| `num_actions` | Number of action/choices at every step |
 | `allowed_wrong_actions` | Maximum no of subsequent wrong actions choices taken after which environment/game will be terminated |
 | `hop` | Relative Backward distance of transitioned state (when wrong action/choise is selected) |
 | `disclose_state_node` | Flag for disclosing state node (True/False) [handicap/ no-handicap version]|
